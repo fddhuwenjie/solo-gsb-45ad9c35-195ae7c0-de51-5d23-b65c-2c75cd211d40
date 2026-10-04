@@ -62,24 +62,19 @@ from .models import (
     CertificateReview,
     CrlEvidence,
     EndpointRevocationResult,
+    NormalizeFingerprintIssue,
     OcspEvidence,
     RevocationReviewRequest,
     RevocationReviewResult,
     UnattributedEvidence,
 )
-from .normalize import (
-    FINGERPRINT_RE,
-    NormalizeChainIssue,
+from .chain_context import (
+    LeafRef,
     NormalizeError,
-    NormalizeFingerprintIssue,
-    _build_issuer_edges,
-    _dedupe_paths,
-    _enumerate_paths,
-    _find_trust_path,
-    _has_second_trust_path,
-    _load_pem_bundle,
-    _verify_signature,
-    _verify_signed_data,
+    VerificationContext,
+    chain_resolution_error,
+    normalize_fingerprint,
+    verify_signed_data as _verify_signed_data,
     cert_fingerprint,
 )
 from .ocsp import (
@@ -728,55 +723,6 @@ def _evaluate_crl(
 
 
 # ---------------------------------------------------------------------------
-# Chain resolution (same exact verdict as /deployments/precheck)
-# ---------------------------------------------------------------------------
-
-
-def _resolve_chains(
-    req: RevocationReviewRequest,
-    certs: dict[str, x509.Certificate],
-    edges: dict[str, list[str]],
-    trust_roots: set[str],
-) -> dict[str, list[str]]:
-    chosen: dict[str, list[str]] = {}
-    chain_issues: list[NormalizeChainIssue] = []
-    roots = frozenset(trust_roots)
-    for e in req.endpoints:
-        fp = e.target_leaf_fingerprint.strip().lower()
-        if fp in chosen:
-            continue
-        first = _find_trust_path(fp, edges, roots)
-        ambiguous = first is not None and _has_second_trust_path(
-            first, edges, roots
-        )
-        if first is not None and not ambiguous:
-            chosen[fp] = first
-            continue
-        valid, dead_ends = _enumerate_paths(fp, edges, roots)
-        chain_issues.append(NormalizeChainIssue(
-            endpoint_id=e.endpoint_id,
-            leaf_role="target",
-            leaf=fp,
-            candidate_issuers=sorted(edges.get(fp, [])),
-            candidate_paths=_dedupe_paths(valid + dead_ends),
-            reason="ambiguous_chain" if ambiguous else "no_trust_path",
-        ))
-    if chain_issues:
-        ambiguous = any(i.reason == "ambiguous_chain" for i in chain_issues)
-        raise NormalizeError(
-            "ambiguous_chain" if ambiguous else "no_trust_path",
-            "cross-signing leaves multiple valid paths to a declared trust "
-            "root" if ambiguous
-            else "no verified signature path from a target leaf to any "
-                 "declared trust root",
-            chain_issues=chain_issues,
-        )
-    return chosen
-
-
-
-
-# ---------------------------------------------------------------------------
 # Per-certificate aggregation
 # ---------------------------------------------------------------------------
 
@@ -1000,19 +946,22 @@ def revocation_review(req: RevocationReviewRequest) -> RevocationReviewResult:
     fingerprint_issues: list[NormalizeFingerprintIssue] = []
     trust_roots: set[str] = set()
     for raw in req.trust_roots:
-        fp = raw.strip().lower()
-        if not FINGERPRINT_RE.match(fp):
+        fp = normalize_fingerprint(raw)
+        if fp is None:
             fingerprint_issues.append(NormalizeFingerprintIssue(
                 fingerprint=raw, referred_by="trust_roots"))
         else:
             trust_roots.add(fp)
+    refs: list[LeafRef] = []
     for e in req.endpoints:
-        fp = e.target_leaf_fingerprint.strip().lower()
-        if not FINGERPRINT_RE.match(fp):
+        fp = normalize_fingerprint(e.target_leaf_fingerprint)
+        if fp is None:
             fingerprint_issues.append(NormalizeFingerprintIssue(
                 fingerprint=e.target_leaf_fingerprint,
                 referred_by=(f"endpoints['{e.endpoint_id}']."
                              f"target_leaf_fingerprint")))
+        refs.append(LeafRef(e.endpoint_id, "target",
+                            e.target_leaf_fingerprint))
     if fingerprint_issues:
         raise NormalizeError(
             "invalid_fingerprint",
@@ -1020,26 +969,16 @@ def revocation_review(req: RevocationReviewRequest) -> RevocationReviewResult:
             fingerprint_issues=fingerprint_issues,
         )
 
-    certs, pem_issues = _load_pem_bundle(req.pem_certificates)
-    if pem_issues:
+    # -- shared verification context (single parse, real signature edges) -----
+    ctx = VerificationContext(req.pem_certificates, trust_roots, refs)
+    if ctx.pem_issues:
         raise NormalizeError(
             "invalid_pem",
             "one or more PEM list elements could not be parsed",
-            pem_issues=pem_issues,
+            pem_issues=ctx.pem_issues,
         )
 
-    missing: list[NormalizeFingerprintIssue] = []
-    for fp in sorted(trust_roots):
-        if fp not in certs:
-            missing.append(NormalizeFingerprintIssue(
-                fingerprint=fp, referred_by="trust_roots"))
-    for e in req.endpoints:
-        fp = e.target_leaf_fingerprint.strip().lower()
-        if fp not in certs:
-            missing.append(NormalizeFingerprintIssue(
-                fingerprint=fp,
-                referred_by=(f"endpoints['{e.endpoint_id}']."
-                             f"target_leaf_fingerprint")))
+    missing = ctx.missing_fingerprint_issues()
     if missing:
         raise NormalizeError(
             "unknown_fingerprint",
@@ -1047,24 +986,17 @@ def revocation_review(req: RevocationReviewRequest) -> RevocationReviewResult:
             fingerprint_issues=missing,
         )
 
-    bad_roots = sorted(
-        fp for fp in trust_roots
-        if certs[fp].subject != certs[fp].issuer
-        or not _verify_signature(certs[fp], certs[fp])
-    )
+    bad_roots = ctx.bad_root_issues()
     if bad_roots:
         raise NormalizeError(
             "trust_root_not_self_signed",
             "every declared trust root must be a self-signed certificate "
             "(subject == issuer with a valid self-signature)",
-            fingerprint_issues=[
-                NormalizeFingerprintIssue(
-                    fingerprint=fp, referred_by="trust_roots")
-                for fp in bad_roots
-            ],
+            fingerprint_issues=bad_roots,
         )
 
-    edges = _build_issuer_edges(certs)
+    certs = ctx.certs
+    edges = ctx.edges
     check_time = req.check_time
     skew = timedelta(seconds=req.max_skew_seconds)
 
@@ -1080,8 +1012,18 @@ def revocation_review(req: RevocationReviewRequest) -> RevocationReviewResult:
         for i, blob in enumerate(req.crls)
     ]
 
-    # -- resolve chains (raises 422 no_trust_path / ambiguous_chain) ----------
-    chains = _resolve_chains(req, certs, edges, trust_roots)
+    # -- resolve chains via the shared exact verdict (422 on failure) --------
+    chains, chain_issues = ctx.resolve_chains(
+        refs, dedupe_leaf_failures=True
+    )
+    if chain_issues:
+        raise chain_resolution_error(
+            chain_issues,
+            ambiguous_message="cross-signing leaves multiple valid paths to a "
+                             "declared trust root",
+            no_path_message="no verified signature path from a target leaf to "
+                            "any declared trust root",
+        )
     chain_edges = {
         (chain[i], chain[i + 1])
         for chain in chains.values()

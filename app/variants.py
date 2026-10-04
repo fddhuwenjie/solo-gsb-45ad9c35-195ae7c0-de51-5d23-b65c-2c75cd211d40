@@ -69,10 +69,10 @@ from .models import (
     VariantSelectionRequest,
     VariantSelectionResult,
 )
-from .normalize import (
+from .chain_context import (
     FINGERPRINT_RE,
-    _load_pem_bundle,
-    _verify_signature,
+    load_pem_bundle as _load_pem_bundle,
+    verify_signature as _verify_signature,
 )
 
 # Dotted OID: non-empty dot-separated arcs of digits, no leading zeros on

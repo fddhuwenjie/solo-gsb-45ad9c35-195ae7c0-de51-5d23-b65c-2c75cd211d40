@@ -63,14 +63,14 @@ from .models import (
     OcspPrecheckRequest,
     OcspPrecheckResult,
 )
-from .normalize import (
+from .chain_context import (
     FINGERPRINT_RE,
     NormalizeError,
-    _build_issuer_edges,
-    _load_pem_bundle,
-    _validity_utc,
-    _verify_signature,
-    _verify_signed_data,
+    build_issuer_edges as _build_issuer_edges,
+    load_pem_bundle as _load_pem_bundle,
+    validity_utc as _validity_utc,
+    verify_signature as _verify_signature,
+    verify_signed_data as _verify_signed_data,
     cert_fingerprint,
 )
 from .precheck import _der_tlv
