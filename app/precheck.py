@@ -3,9 +3,9 @@
 Given the same unordered PEM bag used by ``/scenarios/normalize``, declared
 trust roots and, per endpoint, the fingerprint of its *target* leaf plus the
 DNS/IP identities the endpoint claims to speak for, this module reconstructs
-the target leaf's unique signature-verified chain (reusing the normalizer's
-issuance machinery) and decides whether every declared identity is properly
-certified.
+the target leaf's unique signature-verified chain (via the shared
+:class:`app.chaincontext.ChainVerificationContext`) and decides whether every
+declared identity is properly certified.
 
 The identity rules are deliberately strict and narrow:
 
@@ -47,8 +47,6 @@ from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 
 from .models import (
-    NormalizeChainIssue,
-    NormalizeFingerprintIssue,
     PrecheckEndpoint,
     PrecheckEndpointResult,
     PrecheckIdentityIssue,
@@ -58,16 +56,13 @@ from .models import (
     PrecheckUnsupportedConstraint,
     PrecheckViolation,
 )
-from .normalize import (
+from .chaincontext import (
     FINGERPRINT_RE,
+    ChainVerificationContext,
+    LeafReference,
     NormalizeError,
-    _build_issuer_edges,
-    _dedupe_paths,
-    _enumerate_paths,
-    _find_trust_path,
-    _has_second_trust_path,
-    _load_pem_bundle,
-    _verify_signature,
+    fingerprint_format_issues,
+    normalize_fingerprint,
 )
 
 # ---------------------------------------------------------------------------
@@ -805,7 +800,6 @@ def precheck_identities(req: PrecheckRequest) -> PrecheckResult:
 
     identity_issues: list[PrecheckIdentityIssue] = []
     claims_by_endpoint: dict[str, dict[str, object]] = {}
-    target_fps: list[str] = []
     for e in req.endpoints:
         dns_seen: set[str] = set()
         ip_seen: set[str] = set()
@@ -853,25 +847,27 @@ def precheck_identities(req: PrecheckRequest) -> PrecheckResult:
                         "identity",
             ))
         claims_by_endpoint[e.endpoint_id] = claims
-        target_fps.append(e.target_leaf_fingerprint.strip().lower())
 
     # -- fingerprints --------------------------------------------------------
-    fingerprint_issues: list[NormalizeFingerprintIssue] = []
-    trust_roots: set[str] = set()
-    for raw in req.trust_roots:
-        fp = raw.strip().lower()
-        if not FINGERPRINT_RE.match(fp):
-            fingerprint_issues.append(NormalizeFingerprintIssue(
-                fingerprint=raw, referred_by="trust_roots"))
-        else:
-            trust_roots.add(fp)
+    fp_refs: list[tuple[str, str]] = [
+        (raw, "trust_roots") for raw in req.trust_roots
+    ]
+    leaves: list[LeafReference] = []
     for e in req.endpoints:
-        fp = e.target_leaf_fingerprint.strip().lower()
-        if not FINGERPRINT_RE.match(fp):
-            fingerprint_issues.append(NormalizeFingerprintIssue(
-                fingerprint=e.target_leaf_fingerprint,
-                referred_by=(f"endpoints['{e.endpoint_id}']."
-                             f"target_leaf_fingerprint")))
+        fp_refs.append((
+            e.target_leaf_fingerprint,
+            f"endpoints['{e.endpoint_id}'].target_leaf_fingerprint",
+        ))
+        leaves.append(LeafReference(
+            e.endpoint_id, "target",
+            normalize_fingerprint(e.target_leaf_fingerprint),
+        ))
+    fingerprint_issues = fingerprint_format_issues(fp_refs)
+    trust_roots = {
+        fp
+        for fp in map(normalize_fingerprint, req.trust_roots)
+        if FINGERPRINT_RE.match(fp)
+    }
 
     if identity_issues:
         raise NormalizeError(
@@ -887,99 +883,30 @@ def precheck_identities(req: PrecheckRequest) -> PrecheckResult:
             fingerprint_issues=fingerprint_issues,
         )
 
-    # -- PEM parsing ----------------------------------------------------------
-    certs, pem_issues = _load_pem_bundle(req.pem_certificates)
-    if pem_issues:
-        raise NormalizeError(
-            "invalid_pem",
-            "one or more PEM list elements could not be parsed",
-            pem_issues=pem_issues,
-        )
+    # -- shared verification context: parse, dedupe, verify, resolve ----------
+    ctx = ChainVerificationContext(req.pem_certificates)
 
-    missing: list[NormalizeFingerprintIssue] = []
-    for fp in sorted(trust_roots):
-        if fp not in certs:
-            missing.append(NormalizeFingerprintIssue(
-                fingerprint=fp, referred_by="trust_roots"))
-    for e in req.endpoints:
-        fp = e.target_leaf_fingerprint.strip().lower()
-        if fp not in certs:
-            missing.append(NormalizeFingerprintIssue(
-                fingerprint=fp,
-                referred_by=(f"endpoints['{e.endpoint_id}']."
-                             f"target_leaf_fingerprint")))
-    if missing:
-        raise NormalizeError(
-            "unknown_fingerprint",
-            "some fingerprints do not match any certificate in the PEM bundle",
-            fingerprint_issues=missing,
-        )
-
-    bad_roots = sorted(
-        fp for fp in trust_roots
-        if certs[fp].subject != certs[fp].issuer
-        or not _verify_signature(certs[fp], certs[fp])
+    ctx.require_known_fingerprints(
+        [(fp, "trust_roots") for fp in sorted(trust_roots)]
+        + [
+            (ref.fingerprint,
+             f"endpoints['{ref.endpoint_id}'].target_leaf_fingerprint")
+            for ref in leaves
+        ]
     )
-    if bad_roots:
-        raise NormalizeError(
-            "trust_root_not_self_signed",
-            "every declared trust root must be a self-signed certificate "
-            "(subject == issuer with a valid self-signature)",
-            fingerprint_issues=[
-                NormalizeFingerprintIssue(
-                    fingerprint=fp, referred_by="trust_roots")
-                for fp in bad_roots
-            ],
-        )
-
-    # -- chain resolution (same exact zero/unique/ambiguous verdict) ---------
-    edges = _build_issuer_edges(certs)
-    roots = frozenset(trust_roots)
-
-    # Exact verdict per distinct target leaf, independent of the diagnostic
-    # sample cap (same machinery as /scenarios/normalize).
-    resolved: dict[str, tuple[Optional[list[str]], bool]] = {}
-    for fp in target_fps:
-        if fp not in resolved:
-            first = _find_trust_path(fp, edges, roots)
-            ambiguous = first is not None and _has_second_trust_path(
-                first, edges, roots)
-            resolved[fp] = (first, ambiguous)
-
-    chain_issues: list[NormalizeChainIssue] = []
-    chosen: dict[str, Optional[list[str]]] = {}
-    for e in req.endpoints:
-        fp = e.target_leaf_fingerprint.strip().lower()
-        first, ambiguous = resolved[fp]
-        if first is not None and not ambiguous:
-            chosen[fp] = first
-            continue
-        chosen[fp] = None
-        valid, dead_ends = _enumerate_paths(fp, edges, roots)
-        chain_issues.append(NormalizeChainIssue(
-            endpoint_id=e.endpoint_id,
-            leaf_role="target",
-            leaf=fp,
-            candidate_issuers=sorted(edges.get(fp, [])),
-            candidate_paths=_dedupe_paths(valid + dead_ends),
-            reason="ambiguous_chain" if ambiguous else "no_trust_path",
-        ))
-    if chain_issues:
-        ambiguous = any(i.reason == "ambiguous_chain" for i in chain_issues)
-        raise NormalizeError(
-            "ambiguous_chain" if ambiguous else "no_trust_path",
-            "cross-signing leaves multiple valid paths to a declared trust "
-            "root" if ambiguous
-            else "no verified signature path from a target leaf to any "
-                 "declared trust root",
-            chain_issues=chain_issues,
-        )
+    ctx.require_self_signed_roots(trust_roots)
+    chosen = ctx.resolve_unique_chains(
+        leaves,
+        trust_roots,
+        no_path_message="no verified signature path from a target leaf to "
+                        "any declared trust root",
+    )
 
     # -- per-endpoint identity evaluation ------------------------------------
     results = [
         evaluate_endpoint(
-            e, certs,
-            chosen[e.target_leaf_fingerprint.strip().lower()],  # type: ignore[arg-type]
+            e, ctx.certs,
+            chosen[normalize_fingerprint(e.target_leaf_fingerprint)],
             claims_by_endpoint[e.endpoint_id],
         )
         for e in req.endpoints

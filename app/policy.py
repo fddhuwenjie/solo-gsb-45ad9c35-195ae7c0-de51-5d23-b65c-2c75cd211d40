@@ -4,8 +4,9 @@ Given the same unordered PEM bag used by ``/scenarios/normalize``, declared
 trust roots, one verification instant ``check_time`` and, per endpoint, the
 fingerprints of its current/target leaves plus its TLS role (``server`` /
 ``client``) and the EKUs the serving leaf is required to assert, this module
-reconstructs both chains with the normalizer's signature-verification
-machinery (issuance edges by real signature verification; exactly one path to
+reconstructs both chains with the shared
+:class:`app.chaincontext.ChainVerificationContext` (issuance edges by real
+signature verification; exactly one path to
 a declared trust root or a structured 422) and audits each chain against the
 RFC 5280 path-policy rules:
 
@@ -45,7 +46,6 @@ the full conflict list and the first conflicting rule.
 from __future__ import annotations
 
 import re
-from typing import Optional
 
 from cryptography import x509
 
@@ -60,20 +60,15 @@ from .models import (
     PolicyReviewResult,
     POLICY_REASON_ORDER,
 )
-from .normalize import (
+from .chaincontext import (
     FINGERPRINT_RE,
-    NormalizeChainIssue,
+    ChainVerificationContext,
+    LeafReference,
     NormalizeError,
-    NormalizeFingerprintIssue,
-    _build_issuer_edges,
-    _dedupe_paths,
     _dn,
-    _enumerate_paths,
-    _find_trust_path,
-    _has_second_trust_path,
-    _load_pem_bundle,
     _validity_utc,
-    _verify_signature,
+    fingerprint_format_issues,
+    normalize_fingerprint,
 )
 
 # Same dotted-OID grammar/length guard as the variants module.
@@ -491,30 +486,28 @@ def policy_review(req: PolicyReviewRequest) -> PolicyReviewResult:
         required_by_endpoint[e.endpoint_id] = good
 
     # -- fingerprint syntax ---------------------------------------------------
-    fingerprint_issues: list[NormalizeFingerprintIssue] = []
-    trust_roots: set[str] = set()
-    for raw in req.trust_roots:
-        fp = raw.strip().lower()
-        if not FINGERPRINT_RE.match(fp):
-            fingerprint_issues.append(NormalizeFingerprintIssue(
-                fingerprint=raw, referred_by="trust_roots"))
-        else:
-            trust_roots.add(fp)
-
-    leaves: list[tuple[str, str, str]] = []  # (endpoint_id, role, fp)
+    fp_refs: list[tuple[str, str]] = [
+        (raw, "trust_roots") for raw in req.trust_roots
+    ]
+    leaves: list[LeafReference] = []
     for e in req.endpoints:
         for role, raw in (
             ("current", e.current_leaf_fingerprint),
             ("target", e.target_leaf_fingerprint),
         ):
-            fp = raw.strip().lower()
-            if not FINGERPRINT_RE.match(fp):
-                fingerprint_issues.append(NormalizeFingerprintIssue(
-                    fingerprint=raw,
-                    referred_by=(f"endpoints['{e.endpoint_id}']."
-                                 f"{role}_leaf_fingerprint"),
-                ))
-            leaves.append((e.endpoint_id, role, fp))
+            fp_refs.append((
+                raw,
+                f"endpoints['{e.endpoint_id}'].{role}_leaf_fingerprint",
+            ))
+            leaves.append(LeafReference(
+                e.endpoint_id, role, normalize_fingerprint(raw)
+            ))
+    fingerprint_issues = fingerprint_format_issues(fp_refs)
+    trust_roots = {
+        fp
+        for fp in map(normalize_fingerprint, req.trust_roots)
+        if FINGERPRINT_RE.match(fp)
+    }
 
     if eku_issues:
         raise NormalizeError(
@@ -530,90 +523,24 @@ def policy_review(req: PolicyReviewRequest) -> PolicyReviewResult:
             fingerprint_issues=fingerprint_issues,
         )
 
-    # -- PEM parsing ----------------------------------------------------------
-    certs, pem_issues = _load_pem_bundle(req.pem_certificates)
-    if pem_issues:
-        raise NormalizeError(
-            "invalid_pem",
-            "one or more PEM list elements could not be parsed",
-            pem_issues=pem_issues,
-        )
+    # -- shared verification context: parse, dedupe, verify, resolve ----------
+    ctx = ChainVerificationContext(req.pem_certificates)
 
-    missing: list[NormalizeFingerprintIssue] = []
-    for fp in sorted(trust_roots):
-        if fp not in certs:
-            missing.append(NormalizeFingerprintIssue(
-                fingerprint=fp, referred_by="trust_roots"))
-    for endpoint_id, role, fp in leaves:
-        if fp not in certs:
-            missing.append(NormalizeFingerprintIssue(
-                fingerprint=fp,
-                referred_by=(f"endpoints['{endpoint_id}']."
-                             f"{role}_leaf_fingerprint"),
-            ))
-    if missing:
-        raise NormalizeError(
-            "unknown_fingerprint",
-            "some fingerprints do not match any certificate in the PEM bundle",
-            fingerprint_issues=missing,
-        )
-
-    bad_roots = sorted(
-        fp for fp in trust_roots
-        if certs[fp].subject != certs[fp].issuer
-        or not _verify_signature(certs[fp], certs[fp])
+    ctx.require_known_fingerprints(
+        [(fp, "trust_roots") for fp in sorted(trust_roots)]
+        + [
+            (ref.fingerprint,
+             f"endpoints['{ref.endpoint_id}'].{ref.leaf_role}_leaf_fingerprint")
+            for ref in leaves
+        ]
     )
-    if bad_roots:
-        raise NormalizeError(
-            "trust_root_not_self_signed",
-            "every declared trust root must be a self-signed certificate "
-            "(subject == issuer with a valid self-signature)",
-            fingerprint_issues=[
-                NormalizeFingerprintIssue(
-                    fingerprint=fp, referred_by="trust_roots")
-                for fp in bad_roots
-            ],
-        )
-
-    # -- unique chain resolution for current + target leaves ------------------
-    edges = _build_issuer_edges(certs)
-    roots = frozenset(trust_roots)
-
-    resolved: dict[str, tuple[Optional[list[str]], bool]] = {}
-    for _endpoint_id, _role, leaf in leaves:
-        if leaf not in resolved:
-            first = _find_trust_path(leaf, edges, roots)
-            ambiguous = first is not None and _has_second_trust_path(
-                first, edges, roots)
-            resolved[leaf] = (first, ambiguous)
-
-    chain_issues: list[NormalizeChainIssue] = []
-    chosen: dict[str, Optional[list[str]]] = {}
-    for endpoint_id, role, leaf in leaves:
-        first, ambiguous = resolved[leaf]
-        if first is not None and not ambiguous:
-            chosen[leaf] = first
-            continue
-        chosen[leaf] = None
-        valid, dead_ends = _enumerate_paths(leaf, edges, roots)
-        chain_issues.append(NormalizeChainIssue(
-            endpoint_id=endpoint_id,
-            leaf_role=role,  # type: ignore[arg-type]
-            leaf=leaf,
-            candidate_issuers=sorted(edges.get(leaf, [])),
-            candidate_paths=_dedupe_paths(valid + dead_ends),
-            reason="ambiguous_chain" if ambiguous else "no_trust_path",
-        ))
-    if chain_issues:
-        ambiguous = any(i.reason == "ambiguous_chain" for i in chain_issues)
-        raise NormalizeError(
-            "ambiguous_chain" if ambiguous else "no_trust_path",
-            "cross-signing leaves multiple valid paths to a declared trust "
-            "root" if ambiguous
-            else "no verified signature path from a leaf to any declared "
-                 "trust root",
-            chain_issues=chain_issues,
-        )
+    ctx.require_self_signed_roots(trust_roots)
+    chosen = ctx.resolve_unique_chains(
+        leaves,
+        trust_roots,
+        no_path_message="no verified signature path from a leaf to any "
+                        "declared trust root",
+    )
 
     # -- per-endpoint, per-chain policy audit ---------------------------------
     results: list[PolicyReviewEndpointResult] = []
@@ -623,13 +550,13 @@ def policy_review(req: PolicyReviewRequest) -> PolicyReviewResult:
             e.endpoint_id]})
         current = _chain_review(
             "current",
-            chosen[e.current_leaf_fingerprint.strip().lower()],  # type: ignore[arg-type]
-            certs, e, req.check_time,
+            chosen[normalize_fingerprint(e.current_leaf_fingerprint)],
+            ctx.certs, e, req.check_time,
         )
         target = _chain_review(
             "target",
-            chosen[e.target_leaf_fingerprint.strip().lower()],  # type: ignore[arg-type]
-            certs, e, req.check_time,
+            chosen[normalize_fingerprint(e.target_leaf_fingerprint)],
+            ctx.certs, e, req.check_time,
         )
         # First conflicting rule: the current (currently served) chain gates
         # before the target; within a chain conflicts are already precedence-
@@ -643,8 +570,10 @@ def policy_review(req: PolicyReviewRequest) -> PolicyReviewResult:
         results.append(PolicyReviewEndpointResult(
             endpoint_id=e.endpoint_id,
             role=e.role,
-            current_leaf_fingerprint=e.current_leaf_fingerprint.strip().lower(),
-            target_leaf_fingerprint=e.target_leaf_fingerprint.strip().lower(),
+            current_leaf_fingerprint=normalize_fingerprint(
+                e.current_leaf_fingerprint),
+            target_leaf_fingerprint=normalize_fingerprint(
+                e.target_leaf_fingerprint),
             eligible=current.eligible and target.eligible,
             reason=endpoint_reason,
             current_chain=current,

@@ -718,7 +718,7 @@ def test_crl_same_key_reissued_ca_copies_bind_as_one_issuer(pki):
     # signature edges, but both wrappers end at the same single trust root via
     # one wrapper; verify the service's treatment directly against the
     # evaluator when the chain wrapper is the original.
-    from app.normalize import _load_pem_bundle
+    from app.chaincontext import _load_pem_bundle
     certs, _issues = _load_pem_bundle(
         _bundle(pki) + [_pem(reissued)])
     from app.revocation import _evaluate_crl

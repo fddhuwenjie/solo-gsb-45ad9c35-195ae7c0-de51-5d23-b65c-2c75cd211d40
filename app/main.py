@@ -51,7 +51,8 @@ from .models import (
     VariantSelectionRequest,
     VariantSelectionResult,
 )
-from .normalize import NormalizeError, normalize_scenario
+from .chaincontext import NormalizeError
+from .normalize import normalize_scenario
 from .ocsp import ocsp_precheck
 from .policy import policy_review
 from .precheck import precheck_identities

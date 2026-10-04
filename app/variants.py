@@ -69,7 +69,7 @@ from .models import (
     VariantSelectionRequest,
     VariantSelectionResult,
 )
-from .normalize import (
+from .chaincontext import (
     FINGERPRINT_RE,
     _load_pem_bundle,
     _verify_signature,

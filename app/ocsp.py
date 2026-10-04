@@ -63,7 +63,7 @@ from .models import (
     OcspPrecheckRequest,
     OcspPrecheckResult,
 )
-from .normalize import (
+from .chaincontext import (
     FINGERPRINT_RE,
     NormalizeError,
     _build_issuer_edges,

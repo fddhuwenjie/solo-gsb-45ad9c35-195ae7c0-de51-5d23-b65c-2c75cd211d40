@@ -13,7 +13,7 @@ from cryptography.x509.oid import NameOID
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.normalize import _find_trust_path, _has_second_trust_path
+from app.chaincontext import _find_trust_path, _has_second_trust_path
 
 NOW = datetime(2026, 9, 1, tzinfo=timezone.utc)
 
